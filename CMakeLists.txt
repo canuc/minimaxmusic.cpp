@@ -4,6 +4,14 @@ project(minimaxmusic-ggml LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Optional native lyric-to-audio alignment. This materializes LM attention
+# probabilities and ships the HOT-Step-derived monotonic DTW/LRC code. Keep it
+# out of ordinary builds so their binary and fast attention path are unchanged.
+option(MINIMAXMUSIC_ENABLE_LRC "Build native MiniMax Music3 LRC lyric alignment" OFF)
+if(MINIMAXMUSIC_ENABLE_LRC)
+    add_compile_definitions(MM3_ENABLE_LRC_ALIGNMENT=1)
+endif()
+
 # version.h: embed git commit hash into all binaries.
 # runs on every build, only rewrites if the hash changed.
 set(VERSION_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/version.h")

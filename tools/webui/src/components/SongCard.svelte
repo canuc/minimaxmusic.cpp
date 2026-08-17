@@ -43,6 +43,18 @@
 		URL.revokeObjectURL(url);
 	}
 
+	function downloadLrc() {
+		if (!song.lrc) return;
+		const blob = new Blob([song.lrc], { type: 'application/x-lrc;charset=utf-8' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		const safe = song.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '') || 'song';
+		a.download = `${safe}.lrc`;
+		a.click();
+		URL.revokeObjectURL(url);
+	}
+
 	let confirmDeleteOpen = $state(false);
 	let confirmDeleteNonFavOpen = $state(false);
 	let renameOpen = $state(false);
@@ -114,6 +126,9 @@
 		{ icon: Pencil, label: 'Edit prompt', onSelect: load },
 		{ icon: Type, label: 'Rename song', onSelect: openRename },
 		{ icon: Download, label: 'Download audio', onSelect: downloadAudio },
+		...(song.lrc
+			? [{ icon: Download, label: 'Download lyrics (.lrc)', onSelect: downloadLrc }]
+			: []),
 		{ icon: Trash2, label: 'Delete this track', onSelect: () => (confirmDeleteOpen = true) },
 		{
 			icon: TriangleAlert,

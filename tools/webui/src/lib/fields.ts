@@ -11,7 +11,7 @@ export type FieldSection = 'content' | 'lm' | 'lm_advanced' | 'flow' | 'post' | 
 interface FieldDef {
 	key: keyof MM3Request;
 	section: FieldSection;
-	type: 'str' | 'num';
+	type: 'str' | 'num' | 'bool';
 }
 
 export const FIELDS: readonly FieldDef[] = [
@@ -28,6 +28,7 @@ export const FIELDS: readonly FieldDef[] = [
 	{ key: 'lm_cfg', section: 'lm_advanced', type: 'num' },
 	{ key: 'lm_top_k', section: 'lm_advanced', type: 'num' },
 	{ key: 'audio_codes', section: 'lm_advanced', type: 'str' },
+	{ key: 'get_lrc', section: 'lm_advanced', type: 'bool' },
 
 	// flow: flow matching settings
 	{ key: 'steps', section: 'flow', type: 'num' },
@@ -69,6 +70,7 @@ function resolveField(f: FieldDef, raw: unknown): unknown {
 		const n = num(raw);
 		return n != null ? n : undefined;
 	}
+	if (f.type === 'bool') return raw === true ? true : undefined;
 	return raw ? String(raw) : undefined;
 }
 

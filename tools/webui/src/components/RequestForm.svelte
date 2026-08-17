@@ -37,7 +37,8 @@
 				seed: r.seed ?? 0,
 				duration: r.duration ?? 0,
 				request: r,
-				audio: tracks[i].audio
+				audio: tracks[i].audio,
+				lrc: tracks[i].lrc
 			};
 			song.id = await putSong(song);
 		}
@@ -359,6 +360,13 @@
 					/></label
 				>
 			</div>
+			{#if app.props?.lrc_alignment}
+				<label
+					title="Line-level timestamps derived from the MiniMax LM attention heads. Slows the AR stage."
+				>
+					<input type="checkbox" bind:checked={app.request.get_lrc} /> Native lyric timestamps (LRC)
+				</label>
+			{/if}
 			<label
 				>Audio codes
 				<textarea

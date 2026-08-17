@@ -5,6 +5,11 @@ if(NOT MSVC)
     target_link_libraries(test-philox PRIVATE m)
 endif()
 
+# test-request: JSON request defaults and round-trip contract (no models).
+add_executable(test-request test-request.cpp ${CMAKE_SOURCE_DIR}/src/request.cpp)
+target_include_directories(test-request PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-request PRIVATE yyjson)
+
 # test-vae: flow VAE decoder parity harness against the torch reference.
 add_executable(test-vae test-vae.cpp)
 link_ggml_backends(test-vae)
@@ -28,3 +33,8 @@ link_ggml_backends(test-lm)
 # test-model-store: eviction policy and refcount invariants of the store.
 add_executable(test-model-store test-model-store.cpp ${CMAKE_SOURCE_DIR}/src/model-store.cpp)
 link_ggml_backends(test-model-store)
+
+if(MINIMAXMUSIC_ENABLE_LRC)
+    add_executable(test-lyrics-align test-lyrics-align.cpp)
+    link_ggml_backends(test-lyrics-align)
+endif()

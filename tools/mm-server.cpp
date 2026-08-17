@@ -41,6 +41,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -219,6 +220,7 @@ static const char * MULTIPART_BOUNDARY = "mm3-batch-boundary";
 
 static std::string multipart_build_tracks(const std::vector<std::string> & request_parts,
                                           const std::vector<std::string> & audio_parts,
+                                          const std::vector<std::string> & lrc_parts,
                                           const char *                     audio_mime) {
     // One set of literal fragments sizes the body exactly and builds it:
     // audio parts weigh tens of MB, growing the string through repeated
@@ -226,6 +228,7 @@ static std::string multipart_build_tracks(const std::vector<std::string> & reque
     const char * dash       = "--";
     const char * json_head  = "\r\nContent-Type: application/json\r\n\r\n";
     const char * audio_head = "\r\nContent-Type: ";
+    const char * lrc_head   = "\r\nContent-Type: application/x-lrc; charset=utf-8\r\n\r\n";
     const char * head_end   = "\r\n\r\n";
     const char * crlf       = "\r\n";
     const char * close_end  = "--\r\n";
@@ -236,6 +239,9 @@ static std::string multipart_build_tracks(const std::vector<std::string> & reque
     size_t total = strlen(dash) + boundary_len + strlen(close_end);
     for (size_t i = 0; i < audio_parts.size(); i++) {
         total += per_track + request_parts[i].size() + audio_parts[i].size();
+        if (i < lrc_parts.size() && !lrc_parts[i].empty()) {
+            total += strlen(dash) + boundary_len + strlen(lrc_head) + lrc_parts[i].size() + strlen(crlf);
+        }
     }
 
     std::string body;
@@ -253,6 +259,13 @@ static std::string multipart_build_tracks(const std::vector<std::string> & reque
         body += head_end;
         body += audio_parts[i];
         body += crlf;
+        if (i < lrc_parts.size() && !lrc_parts[i].empty()) {
+            body += dash;
+            body += MULTIPART_BOUNDARY;
+            body += lrc_head;
+            body += lrc_parts[i];
+            body += crlf;
+        }
     }
     body += dash;
     body += MULTIPART_BOUNDARY;
@@ -279,6 +292,7 @@ struct Job {
     std::atomic<JobStatus> status{ JobStatus::RUNNING };
     std::string            result_body;
     std::string            result_mime;
+    std::string            result_lrc_base64;  // single-track HOT-Step-compatible header
     std::atomic<bool>      cancel{ false };
 
     // memory ordering contract: result_body and result_mime are written
@@ -286,6 +300,29 @@ struct Job {
     // and only reads result fields after seeing done/failed. this guarantees
     // visibility without an explicit mutex on the result fields.
 };
+
+static std::string base64_encode(const std::string & input) {
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((input.size() + 2) / 3) * 4);
+    uint32_t value = 0;
+    int      bits  = -6;
+    for (unsigned char byte : input) {
+        value = (value << 8) | byte;
+        bits += 8;
+        while (bits >= 0) {
+            out += alphabet[(value >> bits) & 0x3f];
+            bits -= 6;
+        }
+    }
+    if (bits > -6) {
+        out += alphabet[((value << 8) >> (bits + 8)) & 0x3f];
+    }
+    while (out.size() % 4 != 0) {
+        out += '=';
+    }
+    return out;
+}
 
 static std::mutex                                            mtx_jobs;
 static std::unordered_map<std::string, std::shared_ptr<Job>> g_jobs;
@@ -538,6 +575,12 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         json_error(res, 400, "synth_batch_size must be between 1 and 9");
         return;
     }
+#ifndef MM3_ENABLE_LRC_ALIGNMENT
+    if (r.get_lrc) {
+        json_error(res, 400, "get_lrc requires a build configured with MINIMAXMUSIC_ENABLE_LRC=ON");
+        return;
+    }
+#endif
     if (g_tok_ready) {
         std::vector<int> ids = mm3_build_prompt_ids([](const std::string & s) { return bpe_encode(&g_tok, s, false); },
                                                     r.caption, r.lyrics);
@@ -592,7 +635,8 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
 
         std::vector<std::vector<float>> tracks;
         std::vector<std::string>        codes;
-        PipelineStatus                  status = pipeline_generate(&g_pipeline, r, &job->cancel, tracks, &codes);
+        std::vector<std::string>        lrc_by_song;
+        PipelineStatus status = pipeline_generate(&g_pipeline, r, &job->cancel, tracks, &codes, &lrc_by_song);
         if (status == PIPELINE_CANCELLED) {
             job->status.store(JobStatus::CANCELLED);
             return;
@@ -623,12 +667,19 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         // one audio part per track. Codes are per song, seeds per track.
         int                      M = (int) (tracks.size() / codes.size());
         std::vector<std::string> requests(parts.size());
+        std::vector<std::string> lrc_parts(parts.size());
         for (size_t i = 0; i < parts.size(); i++) {
             MM3Request replay = request_replay(r, codes[i / M], (int) (i / M), (int) (i % M));
             requests[i]       = request_to_json(&replay, true);
+            if (i / (size_t) M < lrc_by_song.size()) {
+                lrc_parts[i] = lrc_by_song[i / (size_t) M];
+            }
         }
-        job->result_body = multipart_build_tracks(requests, parts, mime);
+        job->result_body = multipart_build_tracks(requests, parts, lrc_parts, mime);
         job->result_mime = MULTIPART_MIME;
+        if (lrc_parts.size() == 1 && !lrc_parts[0].empty()) {
+            job->result_lrc_base64 = base64_encode(lrc_parts[0]);
+        }
         job->status.store(JobStatus::DONE);
     });
 
@@ -643,6 +694,11 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "version", MM3_VERSION);
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    yyjson_mut_obj_add_bool(doc, root, "lrc_alignment", true);
+#else
+    yyjson_mut_obj_add_bool(doc, root, "lrc_alignment", false);
+#endif
 
     // models: available model names per bucket
     auto add_names = [&](yyjson_mut_val * parent, const char * key, const std::vector<ModelEntry> & bucket) {
@@ -796,6 +852,9 @@ int main(int argc, char ** argv) {
             if (job->status.load() != JobStatus::DONE) {
                 json_error(res, 404, "Result not ready");
                 return;
+            }
+            if (!job->result_lrc_base64.empty()) {
+                res.set_header("X-LRC-Text", job->result_lrc_base64);
             }
             res.set_content(job->result_body, job->result_mime);
             return;

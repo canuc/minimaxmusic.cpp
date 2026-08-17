@@ -64,6 +64,7 @@ export async function pollJob(id: string): Promise<void> {
 export interface JobTrack {
 	request: MM3Request;
 	audio: Blob;
+	lrc?: string;
 }
 
 // GET /job?id=X&result=1: the finished tracks of a job. The response is
@@ -82,9 +83,11 @@ export async function jobResultTracks(id: string): Promise<JobTrack[]> {
 	for (const part of parts) {
 		if (part.type === 'application/json') {
 			pending = JSON.parse(await part.text()) as MM3Request;
-		} else if (pending) {
+		} else if (part.type.startsWith('audio/') && pending) {
 			tracks.push({ request: pending, audio: part });
 			pending = null;
+		} else if (part.type.startsWith('application/x-lrc') && tracks.length > 0) {
+			tracks[tracks.length - 1].lrc = await part.text();
 		}
 	}
 	return tracks;

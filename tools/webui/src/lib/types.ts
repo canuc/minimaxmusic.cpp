@@ -3,6 +3,7 @@
 export interface MM3Request {
 	caption: string;
 	lyrics?: string;
+	get_lrc?: boolean;
 	duration?: number;
 	steps?: number;
 	seed?: number;
@@ -26,6 +27,7 @@ export interface MM3Request {
 // GET /props response
 export interface MM3Props {
 	version: string;
+	lrc_alignment: boolean;
 	models: {
 		lm: string[];
 		depth: string[];
@@ -47,6 +49,8 @@ export interface Song {
 	duration: number;
 	request: MM3Request;
 	audio: Blob;
+	// Native line-level lyric timestamps, when requested and alignment succeeded.
+	lrc?: string;
 	// user-marked favorite, persisted across reloads. Acts as a sticky
 	// flag for the bulk "Delete non-favorites" action.
 	favorite?: boolean;

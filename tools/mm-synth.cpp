@@ -33,6 +33,7 @@ static void print_usage(const char * argv0) {
             "  --steps <N>            Euler steps per DiT window\n"
             "  --seed <N>             DiT noise seed\n"
             "  --lm-seed <N>          Autoregressive sampling seed\n"
+            "  --lrc                  Emit line-level <output>.lrc (LRC-enabled builds)\n"
             "\n"
             "Debug:\n"
             "  --max-seq <N>          LM KV cache size (default: model context)\n"
@@ -76,6 +77,8 @@ int main(int argc, char ** argv) {
             req.seed = atoll(argv[++i]);
         } else if (a == "--lm-seed" && i + 1 < argc) {
             req.lm_seed = atoll(argv[++i]);
+        } else if (a == "--lrc") {
+            req.get_lrc = true;
         } else if (a == "--max-seq" && i + 1 < argc) {
             params.max_seq = atoi(argv[++i]);
         } else if (a == "--no-fa") {
@@ -103,6 +106,12 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 1;
     }
+#ifndef MM3_ENABLE_LRC_ALIGNMENT
+    if (req.get_lrc) {
+        fprintf(stderr, "[CLI] ERROR: --lrc requires -DMINIMAXMUSIC_ENABLE_LRC=ON at build time\n");
+        return 1;
+    }
+#endif
     request_resolve_seed(&req);
     request_resolve_lm_seed(&req);
     params.max_batch = req.lm_batch_size < 1 ? 1 : req.lm_batch_size;
@@ -135,7 +144,8 @@ int main(int argc, char ** argv) {
 
     std::vector<std::vector<float>> tracks;
     std::vector<std::string>        codes;
-    if (pipeline_generate(&pipeline, req, nullptr, tracks, &codes) != PIPELINE_OK) {
+    std::vector<std::string>        lrc_by_song;
+    if (pipeline_generate(&pipeline, req, nullptr, tracks, &codes, &lrc_by_song) != PIPELINE_OK) {
         return 1;
     }
 
@@ -162,6 +172,22 @@ int main(int argc, char ** argv) {
         MM3Request  replay    = request_replay(req, codes[i / M], (int) (i / M), (int) (i % M));
         if (!request_write(&replay, json_path.c_str())) {
             return 1;
+        }
+        if (i / (size_t) M < lrc_by_song.size() && !lrc_by_song[i / (size_t) M].empty()) {
+            std::string lrc_path = (pdot != std::string::npos ? path.substr(0, pdot) : path) + ".lrc";
+            FILE *      lrc_file = fopen(lrc_path.c_str(), "wb");
+            if (!lrc_file) {
+                fprintf(stderr, "[LRC] FATAL: cannot write %s\n", lrc_path.c_str());
+                return 1;
+            }
+            const std::string & text = lrc_by_song[i / (size_t) M];
+            const size_t        wrote = fwrite(text.data(), 1, text.size(), lrc_file);
+            fclose(lrc_file);
+            if (wrote != text.size()) {
+                fprintf(stderr, "[LRC] FATAL: short write to %s\n", lrc_path.c_str());
+                return 1;
+            }
+            fprintf(stderr, "[LRC] Wrote %s\n", lrc_path.c_str());
         }
     }
     store_free(store);

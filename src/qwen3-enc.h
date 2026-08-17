@@ -76,9 +76,13 @@ static struct ggml_tensor * qwen3_attn_f32(struct ggml_context * ctx,
                                            struct ggml_tensor *  k,
                                            struct ggml_tensor *  v,
                                            struct ggml_tensor *  mask,
-                                           float                 scale) {
+                                           float                 scale,
+                                           struct ggml_tensor ** out_scores = nullptr) {
     struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
     scores                      = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
+    if (out_scores) {
+        *out_scores = scores;
+    }
     struct ggml_tensor * vt     = ggml_cont(ctx, ggml_transpose(ctx, v));
     struct ggml_tensor * out    = ggml_mul_mat(ctx, vt, scores);
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));

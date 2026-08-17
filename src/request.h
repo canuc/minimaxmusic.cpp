@@ -13,6 +13,11 @@ struct MM3Request {
     std::string caption;  // ""
     std::string lyrics;   // ""
 
+    // Native lyric-to-audio alignment. Available only in builds configured
+    // with -DMINIMAXMUSIC_ENABLE_LRC=ON. When requested, line-level LRC is
+    // returned beside each generated track.
+    bool get_lrc;  // false
+
     // generation
     float   duration;  // 60.0, seconds, capped by the 9000 frame LM budget
     int     steps;     // 30, Euler steps per DiT window

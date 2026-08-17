@@ -15,6 +15,7 @@ static const yyjson_write_flag WRITE_FLAGS =
 void request_init(MM3Request * r) {
     r->caption = "";
     r->lyrics  = "";
+    r->get_lrc = false;
 
     r->duration = 60.0f;
     r->steps    = 30;
@@ -53,6 +54,9 @@ static void request_parse_obj(yyjson_val * obj, MM3Request * r) {
     }
     if ((v = yyjson_obj_get(obj, "lyrics")) && yyjson_is_str(v)) {
         r->lyrics = yy_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "get_lrc")) && yyjson_is_bool(v)) {
+        r->get_lrc = yyjson_get_bool(v);
     }
     if ((v = yyjson_obj_get(obj, "output_format")) && yyjson_is_str(v)) {
         r->output_format = yy_str(v);
@@ -184,9 +188,15 @@ std::string request_to_json(const MM3Request * r, bool sparse) {
             yyjson_mut_obj_add_sint(doc, root, key, v);
         }
     };
+    auto put_b = [&](const char * key, bool v, bool d) {
+        if (!sparse || v != d) {
+            yyjson_mut_obj_add_bool(doc, root, key, v);
+        }
+    };
 
     put_str("caption", r->caption, def.caption);
     put_str("lyrics", r->lyrics, def.lyrics);
+    put_b("get_lrc", r->get_lrc, def.get_lrc);
     put_f("duration", r->duration, def.duration);
     put_i("steps", r->steps, def.steps);
     put_i("seed", r->seed, def.seed);

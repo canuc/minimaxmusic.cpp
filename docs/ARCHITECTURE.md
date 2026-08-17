@@ -441,6 +441,17 @@ on their line, lowercased); parenthesized lines pass through verbatim
 (section titles or backing vocals, interpreted in context by the model).
 Instrumental tracks still carry lyrics in the official demos.
 
+**`get_lrc`** (bool, default `false`, optional build feature)
+Capture the MiniMax LM attention heads `(12,27)`, `(19,7)`, and `(24,29)`
+during autoregressive generation, run monotonic DTW over the lyric-token
+attention, apply the measured `+0.70 s` generation-lead correction, and emit
+line-level LRC. This requires a build configured with
+`-DMINIMAXMUSIC_ENABLE_LRC=ON`; disabled builds reject requests that set it.
+No additional weights are needed. Correct capture uses manual attention in all
+36 LM layers and therefore slows the AR stage. The result is an
+attention-derived line-start estimate, not ASR-confirmed word timing; an empty
+result means the caller should use its fallback aligner.
+
 **`duration`** (float seconds, default `60.0`)
 Target audio duration, capped by the 9000 frame LM budget (6 minutes).
 The LM can end the song earlier with the end of audio token.
@@ -528,6 +539,7 @@ Optional:
   --out <path>           Output request JSON (default: request.json)
   --duration <s>         Target duration in seconds
   --lm-seed <N>          Autoregressive sampling seed
+  --lrc                  Emit line-level LRC beside the output
 
 Output is numbered for batches: request.json -> request0.json ...
 
@@ -568,6 +580,7 @@ Optional:
   --steps <N>            Euler steps per DiT window
   --seed <N>             DiT noise seed
   --lm-seed <N>          Autoregressive sampling seed
+  --lrc                  Emit line-level <output>.lrc
 
 Debug:
   --max-seq <N>          LM KV cache size (default: model context)
@@ -654,9 +667,10 @@ GET  /job?id=N                  Poll job status
 
 GET  /job?id=N&result=1         Fetch job result
   multipart/mixed, boundary mm3-batch-boundary: one application/json
-  replay request part (the request with audio_codes and the exact seed
-  of the track) then one audio/mpeg or audio/wav part per track
-  (output_format of the request), song-major order
+  replay request part (the request with audio_codes and the exact seed),
+  then one audio/mpeg or audio/wav part, then an optional
+  application/x-lrc part per track, song-major order. Single-track LRC is
+  also returned base64-encoded in X-LRC-Text for HOT-Step compatibility.
   404 while the result is not ready
 
 POST /job?id=N&cancel=1         Cancel a specific job

@@ -4,6 +4,9 @@
 #pragma once
 
 #include "graph-arena.h"
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+#    include "lyrics-align.h"
+#endif
 #include "qwen3-enc.h"  // Qwen3Layer, Qwen3Config, layer build helpers
 #include "static-graph.h"
 
@@ -11,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // LM config (superset of encoder config)
@@ -45,6 +49,7 @@ struct Qw3lmGraphCache {
     int                   key_lm_offset = 0;
     int                   key_lm_count  = 0;
     bool                  key_embeds    = false;
+    bool                  key_capture   = false;
     int                   out_V         = 0;
     struct ggml_cgraph *  gf            = nullptr;
     struct ggml_tensor *  token_ids_t   = nullptr;
@@ -54,11 +59,29 @@ struct Qw3lmGraphCache {
     struct ggml_tensor *  attn_mask     = nullptr;
     struct ggml_tensor *  lgt           = nullptr;
     struct ggml_tensor *  hidden_out    = nullptr;
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    struct ggml_tensor *  attn_scores[MM3_ALIGN_N_HEADS] = {};
+#endif
     StaticGraph           graph;
     std::vector<int>      pos_data;
     std::vector<int64_t>  rows_data;
     std::vector<uint16_t> mask_data;
 };
+
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+// One forward's selected attention slice. data is laid out as
+// [sequence][selected head][lyric token][query/frame].
+struct Qwen3LMAttnCapture {
+    int                col0               = 0;
+    int                col1               = 0;
+    int                requested_sequences = 1;
+    int                n_sequences        = 0;
+    int                n_queries          = 0;
+    std::vector<float> data;
+};
+#else
+struct Qwen3LMAttnCapture {};
+#endif
 
 struct Qwen3LM {
     Qwen3LMConfig cfg;
@@ -82,6 +105,12 @@ struct Qwen3LM {
     ggml_backend_sched_t sched;
     bool                 use_flash_attn;
     bool                 clamp_fp16;  // clamp hidden state on sub-Ampere CUDA (FP16 accumulation overflow)
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    // Runtime request switch. When true all layers use manual attention; the
+    // selected heads are additionally exposed by forwards that receive a
+    // Qwen3LMAttnCapture. All-manual is required for correct timestamps.
+    bool                 capture_attn;
+#endif
 
     // KV cache: per-set, per-layer [D, max_seq, Nkv] f16
     struct ggml_context * kv_ctx;
@@ -356,7 +385,8 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
                                              int                   n_kv_pad,
                                              int                   n_tokens,
                                              bool                  use_flash_attn = true,
-                                             bool                  clamp_fp16     = false) {
+                                             bool                  clamp_fp16     = false,
+                                             struct ggml_tensor ** out_scores     = nullptr) {
     int D   = c.head_dim;
     int Nh  = c.n_heads;
     int Nkv = c.n_kv_heads;
@@ -430,7 +460,7 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
     // Attention (flash or F32 manual fallback)
     float                scale = 1.0f / sqrtf((float) D);
     struct ggml_tensor * attn  = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f) :
-                                                  qwen3_attn_f32(ctx, q, k_full, v_full, mask, scale);
+                                                  qwen3_attn_f32(ctx, q, k_full, v_full, mask, scale, out_scores);
     if (use_flash_attn) {
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     }
@@ -441,6 +471,70 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
     // O projection
     return qwen3_linear(ctx, ly->o_proj, attn);
 }
+
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+// Read the three selected layers' conditional attention into a compact host
+// matrix. The tensors are post-softmax F32 [kv, query, head, sequence].
+static bool qw3lm_read_attn_capture(const Qwen3LMConfig & c,
+                                    struct ggml_tensor * const tensors[MM3_ALIGN_N_HEADS],
+                                    Qwen3LMAttnCapture * capture) {
+    if (!capture || capture->col0 < 0 || capture->col1 <= capture->col0) {
+        return false;
+    }
+    for (int i = 0; i < MM3_ALIGN_N_HEADS; i++) {
+        if (!tensors[i] || tensors[i]->type != GGML_TYPE_F32) {
+            capture->data.clear();
+            return false;
+        }
+    }
+
+    const int n_tokens  = capture->col1 - capture->col0;
+    const int n_queries = (int) tensors[0]->ne[1];
+    const int available_sequences = (int) tensors[0]->ne[3];
+    const int n_sequences = capture->requested_sequences < available_sequences ? capture->requested_sequences :
+                                                                            available_sequences;
+    if (capture->col1 > tensors[0]->ne[0] || n_queries <= 0 || n_sequences <= 0) {
+        capture->data.clear();
+        return false;
+    }
+
+    capture->n_sequences = n_sequences;
+    capture->n_queries   = n_queries;
+    capture->data.assign((size_t) n_sequences * MM3_ALIGN_N_HEADS * (size_t) n_tokens * (size_t) n_queries, 0.0f);
+    std::vector<float> row((size_t) n_tokens);
+    for (int sequence = 0; sequence < n_sequences; sequence++) {
+        for (int selected = 0; selected < MM3_ALIGN_N_HEADS; selected++) {
+            struct ggml_tensor * scores = tensors[selected];
+            const int head = MM3_ALIGN_HEADS[selected].head;
+            if (head < 0 || head >= c.n_heads || capture->col1 > scores->ne[0] ||
+                n_queries != scores->ne[1] || sequence >= scores->ne[3]) {
+                capture->data.clear();
+                return false;
+            }
+            for (int query = 0; query < n_queries; query++) {
+                const size_t offset = (size_t) capture->col0 * scores->nb[0] + (size_t) query * scores->nb[1] +
+                                      (size_t) head * scores->nb[2] + (size_t) sequence * scores->nb[3];
+                ggml_backend_tensor_get(scores, row.data(), offset, (size_t) n_tokens * sizeof(float));
+                for (int token = 0; token < n_tokens; token++) {
+                    const size_t dst = ((((size_t) sequence * MM3_ALIGN_N_HEADS + (size_t) selected) *
+                                         (size_t) n_tokens + (size_t) token) * (size_t) n_queries) + (size_t) query;
+                    capture->data[dst] = row[(size_t) token];
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static void qw3lm_set_attention_capture(Qwen3LM * m, bool enabled) {
+    if (m->capture_attn == enabled) {
+        return;
+    }
+    static_graph_release(&m->batch_graph.graph, m->sched);
+    m->batch_graph.built = false;
+    m->capture_attn      = enabled;
+}
+#endif
 
 // Forward pass: token_ids[n_tokens] -> logits[vocab_size] (last token only)
 // kv_set: which KV cache set to use (0=conditional, 1=unconditional for CFG)
@@ -455,7 +549,8 @@ static void qw3lm_forward(Qwen3LM *     m,
                           float *       logits,
                           const float * input_embeds   = nullptr,
                           float *       out_hidden     = nullptr,
-                          float *       out_hidden_all = nullptr) {
+                          float *       out_hidden_all = nullptr,
+                          Qwen3LMAttnCapture * capture = nullptr) {
     if (m->batch_graph.graph.sched_allocated) {
         static_graph_release(&m->batch_graph.graph, m->sched);
         m->batch_graph.built = false;
@@ -517,6 +612,9 @@ static void qw3lm_forward(Qwen3LM *     m,
     ggml_set_input(kv_rows);
 
     // Transformer layers
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    struct ggml_tensor * capture_scores[MM3_ALIGN_N_HEADS] = {};
+#endif
     for (int l = 0; l < c.n_layers; l++) {
         Qwen3Layer * ly = &m->layers[l];
 
@@ -524,9 +622,25 @@ static void qw3lm_forward(Qwen3LM *     m,
         struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
 
         // Self-attention with KV cache
+        struct ggml_tensor ** score_out = nullptr;
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+        const int selected = m->capture_attn ? mm3_align_head_for_layer(l) : -1;
+        if (selected >= 0) {
+            score_out = &capture_scores[selected];
+        }
+        const bool use_flash = m->use_flash_attn && !m->capture_attn;
+#else
+        const bool use_flash = m->use_flash_attn;
+#endif
         struct ggml_tensor * attn =
             qw3lm_build_attn(ctx, gf, c, ly, norm, positions, mask, kv_rows, m->kv_k[kv_set][l], m->kv_v[kv_set][l],
-                             n_kv_pad, n_tokens, m->use_flash_attn, m->clamp_fp16);
+                             n_kv_pad, n_tokens, use_flash, m->clamp_fp16, score_out);
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+        if (score_out && *score_out) {
+            ggml_set_output(*score_out);
+            ggml_build_forward_expand(gf, *score_out);
+        }
+#endif
 
         // Residual
         hidden = ggml_add(ctx, hidden, attn);
@@ -628,6 +742,11 @@ static void qw3lm_forward(Qwen3LM *     m,
         ggml_backend_tensor_get(all_hidden ? all_hidden : hidden_out, out_hidden_all, 0,
                                 (size_t) n_tokens * H * sizeof(float));
     }
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    if (capture && !qw3lm_read_attn_capture(c, capture_scores, capture)) {
+        fprintf(stderr, "[LRC] Failed to read LM attention slice\n");
+    }
+#endif
 
     // Advance KV position. The arena and the sched allocation persist
     // into the next forward.
@@ -650,7 +769,8 @@ static void qw3lm_forward_batch(Qwen3LM *     m,
                                 int           lm_offset    = 0,
                                 int           lm_count     = 0,
                                 const float * input_embeds = nullptr,
-                                float *       out_hidden   = nullptr) {
+                                float *       out_hidden   = nullptr,
+                                Qwen3LMAttnCapture * capture = nullptr) {
     const Qwen3LMConfig & c   = m->cfg;
     int                   H   = c.hidden_size;
     int                   D   = c.head_dim;
@@ -685,11 +805,16 @@ static void qw3lm_forward_batch(Qwen3LM *     m,
     struct ggml_tensor * lgt         = nullptr;
     int                  out_V       = 0;
 
-    const int  s0         = kv_sets[0];
+    const int s0 = kv_sets[0];
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    const bool capture_changed = m->batch_graph.key_capture != m->capture_attn;
+#else
+    const bool capture_changed = false;
+#endif
     const bool need_build = !m->batch_graph.built || m->batch_graph.key_n_kv_pad != n_kv_pad ||
                             m->batch_graph.key_N != N || m->batch_graph.key_s0 != s0 ||
                             m->batch_graph.key_lm_offset != lm_offset || m->batch_graph.key_lm_count != lm_count ||
-                            m->batch_graph.key_embeds != (input_embeds != nullptr);
+                            m->batch_graph.key_embeds != (input_embeds != nullptr) || capture_changed;
     if (need_build) {
         static_graph_release(&m->batch_graph.graph, m->sched);
         m->batch_graph.built      = false;
@@ -729,6 +854,11 @@ static void qw3lm_forward_batch(Qwen3LM *     m,
 
         struct ggml_tensor * hidden = input_embeds ? embeds_t : ggml_get_rows(ctx, m->embed_tokens, token_ids_t);
 
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+        for (int i = 0; i < MM3_ALIGN_N_HEADS; i++) {
+            m->batch_graph.attn_scores[i] = nullptr;
+        }
+#endif
         for (int l = 0; l < c.n_layers; l++) {
             Qwen3Layer * ly = &m->layers[l];
 
@@ -813,12 +943,29 @@ static void qw3lm_forward_batch(Qwen3LM *     m,
                                                         m->kv_v4[l]->nb[2], m->kv_v4[l]->nb[3], off_s0);
 
             // Batched attention (flash or F32 manual fallback)
+            struct ggml_tensor * scores = nullptr;
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+            const int selected = m->capture_attn ? mm3_align_head_for_layer(l) : -1;
+            const bool use_flash = m->use_flash_attn && !m->capture_attn;
+#else
+            const int selected = -1;
+            const bool use_flash = m->use_flash_attn;
+#endif
             struct ggml_tensor * attn_result =
-                m->use_flash_attn ? ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f) :
-                                    qwen3_attn_f32(ctx, q4, k_batch, v_batch, attn_mask, scale);
-            if (m->use_flash_attn) {
+                use_flash ? ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f) :
+                            qwen3_attn_f32(ctx, q4, k_batch, v_batch, attn_mask, scale,
+                                          selected >= 0 ? &scores : nullptr);
+            if (use_flash) {
                 ggml_flash_attn_ext_set_prec(attn_result, GGML_PREC_F32);
             }
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+            if (selected >= 0 && scores) {
+                ggml_set_name(scores, ("lm_attn_" + std::to_string(l)).c_str());
+                ggml_set_output(scores);
+                ggml_build_forward_expand(gf, scores);
+                m->batch_graph.attn_scores[selected] = scores;
+            }
+#endif
 
             // Output: [D, Nh, 1, N] -> [Nh*D, N]
             struct ggml_tensor * attn_cat = ggml_reshape_2d(ctx, attn_result, Nh * D, N);
@@ -878,6 +1025,9 @@ static void qw3lm_forward_batch(Qwen3LM *     m,
         m->batch_graph.key_lm_offset = lm_offset;
         m->batch_graph.key_lm_count  = lm_count;
         m->batch_graph.key_embeds    = (input_embeds != nullptr);
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+        m->batch_graph.key_capture   = m->capture_attn;
+#endif
         m->batch_graph.pos_data.resize((size_t) N);
         m->batch_graph.rows_data.resize((size_t) N);
         m->batch_graph.mask_data.resize((size_t) n_kv_pad * (size_t) N);
@@ -925,6 +1075,11 @@ static void qw3lm_forward_batch(Qwen3LM *     m,
     if (out_hidden) {
         ggml_backend_tensor_get(m->batch_graph.hidden_out, out_hidden, 0, (size_t) c.hidden_size * N * sizeof(float));
     }
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    if (capture && !qw3lm_read_attn_capture(c, m->batch_graph.attn_scores, capture)) {
+        fprintf(stderr, "[LRC] Failed to read batched LM attention slice\n");
+    }
+#endif
 
     // Advance all KV positions. The arena and the sched allocation
     // persist into the next forward.

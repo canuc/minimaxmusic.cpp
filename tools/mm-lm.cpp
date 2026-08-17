@@ -34,6 +34,7 @@ static void print_usage(const char * prog) {
             "  --out <path>           Output request JSON (default: request.json)\n"
             "  --duration <s>         Target duration in seconds\n"
             "  --lm-seed <N>          Autoregressive sampling seed\n"
+            "  --lrc                  Emit line-level LRC beside each request (LRC-enabled builds)\n"
             "\n"
             "Output is numbered for batches: request.json -> request0.json ...\n"
             "\n"
@@ -85,6 +86,8 @@ int main(int argc, char ** argv) {
             req.duration = (float) atof(argv[++i]);
         } else if (a == "--lm-seed" && i + 1 < argc) {
             req.lm_seed = atoll(argv[++i]);
+        } else if (a == "--lrc") {
+            req.get_lrc = true;
         } else if (a == "--max-seq" && i + 1 < argc) {
             params.max_seq = atoi(argv[++i]);
         } else if (a == "--no-fa") {
@@ -121,6 +124,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[LM] FATAL: the request already carries audio_codes\n");
         return 1;
     }
+#ifndef MM3_ENABLE_LRC_ALIGNMENT
+    if (req.get_lrc) {
+        fprintf(stderr, "[LM] FATAL: --lrc requires -DMINIMAXMUSIC_ENABLE_LRC=ON at build time\n");
+        return 1;
+    }
+#endif
     request_resolve_lm_seed(&req);
     params.max_batch = req.lm_batch_size < 1 ? 1 : req.lm_batch_size;
 
@@ -164,7 +173,8 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<std::string> codes;
-    if (pipeline_lm_generate(&pipeline, req, nullptr, codes) != PIPELINE_OK) {
+    std::vector<std::string> lrc;
+    if (pipeline_lm_generate(&pipeline, req, nullptr, codes, &lrc) != PIPELINE_OK) {
         return 1;
     }
 
@@ -180,6 +190,14 @@ int main(int argc, char ** argv) {
         MM3Request replay = request_replay(req, codes[i], (int) i, 0);
         if (!request_write(&replay, path.c_str())) {
             return 1;
+        }
+        if (i < lrc.size() && !lrc[i].empty()) {
+            size_t      lrc_dot  = path.rfind('.');
+            std::string lrc_path = (lrc_dot != std::string::npos ? path.substr(0, lrc_dot) : path) + ".lrc";
+            if (!write_file(lrc_path.c_str(), lrc[i])) {
+                return 1;
+            }
+            fprintf(stderr, "[LRC] Wrote %s\n", lrc_path.c_str());
         }
     }
     store_free(store);

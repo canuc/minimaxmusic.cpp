@@ -29,6 +29,87 @@ static const int CROP_RIGHT     = 344 - 86;
 static const int HOP            = 512;
 static const int SAMPLE_RATE    = 44100;
 
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+struct MM3LrcCaptureGuard {
+    Qwen3LM * lm;
+
+    MM3LrcCaptureGuard(Qwen3LM * model, bool enabled) : lm(model) {
+        qw3lm_set_attention_capture(lm, enabled);
+    }
+    ~MM3LrcCaptureGuard() {
+        qw3lm_set_attention_capture(lm, false);
+    }
+};
+
+static bool mm3_lrc_prompt_span(const std::vector<int> & prompt, int * first, int * last) {
+    *first = -1;
+    *last  = -1;
+    for (size_t i = 0; i < prompt.size(); i++) {
+        if (prompt[i] == MM3_LYRICS_START) {
+            *first = (int) i + 1;
+        } else if (prompt[i] == MM3_LYRICS_END) {
+            *last = (int) i;
+            break;
+        }
+    }
+    return *first >= 0 && *last > *first;
+}
+
+static bool mm3_lrc_model_supported(const Qwen3LM * lm) {
+    for (int i = 0; i < MM3_ALIGN_N_HEADS; i++) {
+        if (MM3_ALIGN_HEADS[i].layer < 0 || MM3_ALIGN_HEADS[i].layer >= lm->cfg.n_layers ||
+            MM3_ALIGN_HEADS[i].head < 0 || MM3_ALIGN_HEADS[i].head >= lm->cfg.n_heads) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Append a one-query batched capture into [song][head*token][frame] rows.
+static void mm3_lrc_append_frame(const Qwen3LMAttnCapture & capture,
+                                 const std::vector<bool> & active,
+                                 int n_tokens,
+                                 std::vector<std::vector<std::vector<float>>> * rows,
+                                 int song_offset = 0) {
+    if (capture.n_queries != 1 || capture.n_sequences < (int) active.size() ||
+        capture.data.size() != (size_t) capture.n_sequences * MM3_ALIGN_N_HEADS * (size_t) n_tokens ||
+        song_offset < 0 || song_offset + (int) active.size() > (int) rows->size()) {
+        return;
+    }
+    for (size_t song = 0; song < active.size(); song++) {
+        if (!active[song]) {
+            continue;
+        }
+        for (int head = 0; head < MM3_ALIGN_N_HEADS; head++) {
+            for (int token = 0; token < n_tokens; token++) {
+                const size_t src = ((song * MM3_ALIGN_N_HEADS + (size_t) head) * (size_t) n_tokens) +
+                                   (size_t) token;
+                (*rows)[(size_t) song_offset + song][(size_t) head * (size_t) n_tokens + (size_t) token].push_back(
+                    capture.data[src]);
+            }
+        }
+    }
+}
+
+static std::string mm3_lrc_finish(const std::vector<std::vector<float>> & rows,
+                                  const std::vector<int> & lyric_ids,
+                                  const BPETokenizer & tok,
+                                  int n_frames) {
+    if (n_frames <= 1 || rows.size() != (size_t) MM3_ALIGN_N_HEADS * lyric_ids.size()) {
+        return std::string();
+    }
+    std::vector<float> flat;
+    flat.reserve(rows.size() * (size_t) n_frames);
+    for (const auto & row : rows) {
+        if ((int) row.size() < n_frames) {
+            return std::string();
+        }
+        flat.insert(flat.end(), row.begin(), row.begin() + n_frames);
+    }
+    return mm3_align_build_lrc(flat, lyric_ids, tok, n_frames, (float) n_frames / (float) FRAME_RATE);
+}
+#endif
+
 // CFG on logits: guided = uncond + (cond - uncond) * scale, restricted to
 // the conditional branch's top k among allowed ids, then top-k sampled.
 static int mm3_cfg_sample(const float *            cond,
@@ -240,8 +321,12 @@ static PipelineStatus replay_stage(MM3Pipeline *        p,
                                    BPETokenizer *       tok,
                                    const MM3Request &   req,
                                    std::atomic<bool> *  cancel,
-                                   std::vector<float> & frame_hiddens) {
+                                   std::vector<float> & frame_hiddens,
+                                   std::string *        lrc_out) {
     Timer ar_timer;
+    if (lrc_out) {
+        lrc_out->clear();
+    }
 
     std::vector<int> codes = codes_parse(req.audio_codes);
     if (codes.empty()) {
@@ -252,6 +337,17 @@ static PipelineStatus replay_stage(MM3Pipeline *        p,
     std::vector<int> cond_ids = mm3_build_prompt_ids(
         [&](const std::string & str) { return bpe_encode(tok, str, false); }, req.caption, req.lyrics);
     fprintf(stderr, "[Prompt] %zu tokens\n", cond_ids.size());
+
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    int        lyric_first = -1;
+    int        lyric_last  = -1;
+    const bool lrc_enabled = req.get_lrc && mm3_lrc_model_supported(lm) &&
+                             mm3_lrc_prompt_span(cond_ids, &lyric_first, &lyric_last);
+    MM3LrcCaptureGuard lrc_guard(lm, lrc_enabled);
+    if (req.get_lrc && !lrc_enabled) {
+        fprintf(stderr, "[LRC] Prompt or LM architecture does not support native alignment\n");
+    }
+#endif
 
     const int H  = lm->cfg.hidden_size;
     const int V  = lm->cfg.vocab_size;
@@ -285,7 +381,35 @@ static PipelineStatus replay_stage(MM3Pipeline *        p,
         memcpy(embeds.data() + (size_t) t * H, emb.data(), (size_t) H * sizeof(float));
     }
     std::vector<float> all_hidden((size_t) n * H);
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    if (lrc_enabled) {
+        // A single full-sequence manual attention would materialize three
+        // [context x frames] score tensors (gigabytes for a long replay).
+        // Replay one feedback frame at a time through the cached batch graph,
+        // matching sampled generation and keeping capture memory bounded.
+        const int lyric_tokens = lyric_last - lyric_first;
+        std::vector<std::vector<std::vector<float>>> captured(
+            1, std::vector<std::vector<float>>((size_t) MM3_ALIGN_N_HEADS * (size_t) lyric_tokens));
+        const int kv_set = 0;
+        for (int frame = 0; frame < n; frame++) {
+            Qwen3LMAttnCapture attention;
+            attention.col0 = lyric_first;
+            attention.col1 = lyric_last;
+            qw3lm_forward_batch(lm, nullptr, &kv_set, 1, logits.data(), 0, 0,
+                                embeds.data() + (size_t) frame * H, all_hidden.data() + (size_t) frame * H,
+                                &attention);
+            mm3_lrc_append_frame(attention, std::vector<bool>{ true }, lyric_tokens, &captured);
+        }
+        if (lrc_out) {
+            const std::vector<int> lyric_ids(cond_ids.begin() + lyric_first, cond_ids.begin() + lyric_last);
+            *lrc_out = mm3_lrc_finish(captured[0], lyric_ids, *tok, n);
+        }
+    } else {
+        qw3lm_forward(lm, nullptr, n, 0, logits.data(), embeds.data(), nullptr, all_hidden.data());
+    }
+#else
     qw3lm_forward(lm, nullptr, n, 0, logits.data(), embeds.data(), nullptr, all_hidden.data());
+#endif
 
     // Depth hiddens per frame: the whole step sequence is known upfront,
     // one causal S=8 forward reproduces the 7 step hiddens
@@ -312,6 +436,13 @@ static PipelineStatus replay_stage(MM3Pipeline *        p,
     }
     fprintf(stderr, "[AR] Replay: %d frames from audio_codes (%.1fs of music), %.1f s\n", n, (float) n / FRAME_RATE,
             ar_timer.ms() / 1000.0);
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    if (lrc_out) {
+        fprintf(stderr, "[LRC] Replay %s\n", lrc_out->empty() ? "produced no alignment" : "alignment built");
+    }
+#else
+    (void) lrc_out;
+#endif
     return PIPELINE_OK;
 }
 
@@ -326,7 +457,8 @@ static PipelineStatus ar_stage(MM3Pipeline *                     p,
                                int                               N,
                                std::vector<std::vector<float>> * hiddens_out,
                                std::vector<std::vector<int>> &   codes_out,
-                               std::vector<int> &                n_frames) {
+                               std::vector<int> &                n_frames,
+                               std::vector<std::string> *        lrc_out) {
     // Prompt pair, shared by every song in the batch
     std::vector<int> cond_ids =
         mm3_build_prompt_ids([&](const std::string & s) { return bpe_encode(tok, s, false); }, req.caption, req.lyrics);
@@ -335,6 +467,24 @@ static PipelineStatus ar_stage(MM3Pipeline *                     p,
         uncond_ids[i] = MM3_AUDIO_CFG;
     }
     fprintf(stderr, "[Prompt] %zu tokens\n", cond_ids.size());
+
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    int        lyric_first = -1;
+    int        lyric_last  = -1;
+    const bool lrc_enabled = req.get_lrc && mm3_lrc_model_supported(lm) &&
+                             mm3_lrc_prompt_span(cond_ids, &lyric_first, &lyric_last);
+    MM3LrcCaptureGuard lrc_guard(lm, lrc_enabled);
+    const int          lyric_tokens = lrc_enabled ? lyric_last - lyric_first : 0;
+    std::vector<std::vector<std::vector<float>>> lrc_rows;
+    if (lrc_enabled) {
+        lrc_rows.assign((size_t) N,
+                        std::vector<std::vector<float>>((size_t) MM3_ALIGN_N_HEADS * (size_t) lyric_tokens));
+        fprintf(stderr, "[LRC] Capturing %d heads over %d lyric tokens; all LM layers use manual attention\n",
+                MM3_ALIGN_N_HEADS, lyric_tokens);
+    } else if (req.get_lrc) {
+        fprintf(stderr, "[LRC] Prompt or LM architecture does not support native alignment\n");
+    }
+#endif
 
     const int H  = lm->cfg.hidden_size;
     const int V  = lm->cfg.vocab_size;
@@ -543,12 +693,45 @@ static PipelineStatus ar_stage(MM3Pipeline *                     p,
             memcpy(batch_embeds.data() + (size_t) (N + i) * H, feedback.data(), (size_t) H * sizeof(float));
         }
         if (p->params.use_batch_cfg) {
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+            Qwen3LMAttnCapture attention;
+            if (lrc_enabled) {
+                attention.col0                = lyric_first;
+                attention.col1                = lyric_last;
+                attention.requested_sequences = N;
+            }
+            qw3lm_forward_batch(lm, nullptr, kv_sets.data(), 2 * N, cur_logits.data(), 0, 0, batch_embeds.data(),
+                                cur_hidden.data(), lrc_enabled ? &attention : nullptr);
+            if (lrc_enabled) {
+                std::vector<bool> active((size_t) N);
+                for (int i = 0; i < N; i++) {
+                    active[(size_t) i] = !done[(size_t) i];
+                }
+                mm3_lrc_append_frame(attention, active, lyric_tokens, &lrc_rows);
+            }
+#else
             qw3lm_forward_batch(lm, nullptr, kv_sets.data(), 2 * N, cur_logits.data(), 0, 0, batch_embeds.data(),
                                 cur_hidden.data());
+#endif
         } else {
             for (int s = 0; s < 2 * N; s++) {
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+                Qwen3LMAttnCapture attention;
+                const bool capture_this = lrc_enabled && s < N && !done[(size_t) s];
+                if (capture_this) {
+                    attention.col0 = lyric_first;
+                    attention.col1 = lyric_last;
+                }
+                qw3lm_forward(lm, nullptr, 1, s, cur_logits.data() + (size_t) s * V,
+                              batch_embeds.data() + (size_t) s * H, cur_hidden.data() + (size_t) s * H, nullptr,
+                              capture_this ? &attention : nullptr);
+                if (capture_this) {
+                    mm3_lrc_append_frame(attention, std::vector<bool>{ true }, lyric_tokens, &lrc_rows, s);
+                }
+#else
                 qw3lm_forward(lm, nullptr, 1, s, cur_logits.data() + (size_t) s * V,
                               batch_embeds.data() + (size_t) s * H, cur_hidden.data() + (size_t) s * H);
+#endif
             }
         }
 
@@ -566,6 +749,21 @@ static PipelineStatus ar_stage(MM3Pipeline *                     p,
             return PIPELINE_FAILED;
         }
     }
+#ifdef MM3_ENABLE_LRC_ALIGNMENT
+    if (lrc_out) {
+        lrc_out->assign((size_t) N, std::string());
+        if (lrc_enabled) {
+            const std::vector<int> lyric_ids(cond_ids.begin() + lyric_first, cond_ids.begin() + lyric_last);
+            for (int i = 0; i < N; i++) {
+                (*lrc_out)[(size_t) i] = mm3_lrc_finish(lrc_rows[(size_t) i], lyric_ids, *tok, n_frames[(size_t) i]);
+                fprintf(stderr, "[LRC] Song %d: %s\n", i,
+                        (*lrc_out)[(size_t) i].empty() ? "no alignment produced" : "alignment built");
+            }
+        }
+    }
+#else
+    (void) lrc_out;
+#endif
     if (p->dumper.enabled && hiddens_out) {
         int shape[3] = { n_frames[0], 8, H };
         debug_dump(&p->dumper, "frame_hiddens", (*hiddens_out)[0].data(), shape, 3);
@@ -585,8 +783,20 @@ PipelineStatus pipeline_generate(MM3Pipeline *                     p,
                                  const MM3Request &                req,
                                  std::atomic<bool> *               cancel,
                                  std::vector<std::vector<float>> & tracks_out,
-                                 std::vector<std::string> *        codes_out) {
+                                 std::vector<std::string> *        codes_out,
+                                 std::vector<std::string> *        lrc_out) {
     Timer total_timer;
+
+#ifndef MM3_ENABLE_LRC_ALIGNMENT
+    if (req.get_lrc) {
+        fprintf(stderr, "[LRC] FATAL: this build has no native lyric alignment; rebuild with "
+                        "-DMINIMAXMUSIC_ENABLE_LRC=ON\n");
+        return PIPELINE_FAILED;
+    }
+#endif
+    if (lrc_out) {
+        lrc_out->clear();
+    }
 
     int N = req.lm_batch_size < 1 ? 1 : req.lm_batch_size;
     if (N > p->params.max_batch) {
@@ -625,7 +835,8 @@ PipelineStatus pipeline_generate(MM3Pipeline *                     p,
             }
             N = 1;
             frame_hiddens.resize(1);
-            PipelineStatus st = replay_stage(p, lm, depth, tok, req, cancel, frame_hiddens[0]);
+            std::string lrc;
+            PipelineStatus st = replay_stage(p, lm, depth, tok, req, cancel, frame_hiddens[0], &lrc);
             if (st != PIPELINE_OK) {
                 return st;
             }
@@ -637,10 +848,13 @@ PipelineStatus pipeline_generate(MM3Pipeline *                     p,
             if (codes_out) {
                 codes_out->assign(1, req.audio_codes);
             }
+            if (lrc_out) {
+                lrc_out->assign(1, lrc);
+            }
         } else {
             frame_hiddens.resize(N);
             std::vector<std::vector<int>> codes(N);
-            PipelineStatus st = ar_stage(p, lm, depth, tok, req, cancel, N, &frame_hiddens, codes, n_frames);
+            PipelineStatus st = ar_stage(p, lm, depth, tok, req, cancel, N, &frame_hiddens, codes, n_frames, lrc_out);
             if (st != PIPELINE_OK) {
                 return st;
             }
@@ -909,8 +1123,20 @@ PipelineStatus pipeline_generate(MM3Pipeline *                     p,
 PipelineStatus pipeline_lm_generate(MM3Pipeline *              p,
                                     const MM3Request &         req,
                                     std::atomic<bool> *        cancel,
-                                    std::vector<std::string> & codes_out) {
+                                    std::vector<std::string> & codes_out,
+                                    std::vector<std::string> * lrc_out) {
     Timer total_timer;
+
+#ifndef MM3_ENABLE_LRC_ALIGNMENT
+    if (req.get_lrc) {
+        fprintf(stderr, "[LRC] FATAL: this build has no native lyric alignment; rebuild with "
+                        "-DMINIMAXMUSIC_ENABLE_LRC=ON\n");
+        return PIPELINE_FAILED;
+    }
+#endif
+    if (lrc_out) {
+        lrc_out->clear();
+    }
 
     int N = req.lm_batch_size < 1 ? 1 : req.lm_batch_size;
     if (N > p->params.max_batch) {
@@ -935,7 +1161,7 @@ PipelineStatus pipeline_lm_generate(MM3Pipeline *              p,
 
     std::vector<std::vector<int>> codes(N);
     std::vector<int>              n_frames;
-    PipelineStatus                st = ar_stage(p, lm, depth, tok, req, cancel, N, nullptr, codes, n_frames);
+    PipelineStatus                st = ar_stage(p, lm, depth, tok, req, cancel, N, nullptr, codes, n_frames, lrc_out);
     if (st != PIPELINE_OK) {
         return st;
     }

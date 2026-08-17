@@ -72,11 +72,14 @@ void pipeline_configure(MM3Pipeline * p, const MM3ModelPaths & paths, const MM3P
 // cancel: optional, polled at stage boundaries. NULL disables cancellation.
 // codes_out: optional, the audio_codes stream of each song, identical
 // to the input codes under replay. Feeds request_replay.
+// lrc_out: optional, one line-level LRC string per song when get_lrc=true.
+// Empty entries mean native alignment had insufficient evidence.
 PipelineStatus pipeline_generate(MM3Pipeline *                     p,
                                  const MM3Request &                req,
                                  std::atomic<bool> *               cancel,
                                  std::vector<std::vector<float>> & tracks_out,
-                                 std::vector<std::string> *        codes_out);
+                                 std::vector<std::string> *        codes_out,
+                                 std::vector<std::string> *        lrc_out = nullptr);
 
 // Autoregressive stage only: lm_batch_size code streams out, no
 // synthesis. codes_out[i] is the audio_codes string of song i (8 comma
@@ -84,4 +87,5 @@ PipelineStatus pipeline_generate(MM3Pipeline *                     p,
 PipelineStatus pipeline_lm_generate(MM3Pipeline *              p,
                                     const MM3Request &         req,
                                     std::atomic<bool> *        cancel,
-                                    std::vector<std::string> & codes_out);
+                                    std::vector<std::string> & codes_out,
+                                    std::vector<std::string> * lrc_out = nullptr);

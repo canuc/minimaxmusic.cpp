@@ -58,6 +58,13 @@ buildall.cmd      # all backends (CUDA + Vulkan + CPU, runtime loading)
 
 macOS auto-enables Metal and Accelerate BLAS with any of the above.
 
+Native line-level lyric timestamps are an optional build feature. Add
+`-DMINIMAXMUSIC_ENABLE_LRC=ON` to the CMake configure command, then request
+them with JSON `"get_lrc": true` or CLI `--lrc`. The default is `OFF`, so
+ordinary builds retain the existing FlashAttention-only binary and behavior.
+Alignment uses the MiniMax LM's lyric attention and needs no extra model or
+weights, but it runs the 36-layer AR attention path manually and is slower.
+
 ## Convert
 
 To build the GGUFs locally from the official checkpoints instead,
@@ -132,8 +139,10 @@ server caps urlencoded bodies at 8 KB).
 
 **GET /job?id=N** - Poll job status. **GET /job?id=N&result=1** fetches the
 result as multipart/mixed: one JSON replay request part (the request with
-`audio_codes` and the exact seed of the track) then one audio part per
-track (MP3 or WAV, selected by `output_format` in the request).
+`audio_codes` and the exact seed of the track), one audio part, and—when
+requested and successfully aligned—one `application/x-lrc` part per track.
+For a single track, the same LRC is also base64 encoded in `X-LRC-Text` for
+HOT-Step-compatible workers. MP3 or WAV is selected by `output_format`.
 **POST /job?id=N&cancel=1** cancels a running job.
 
 **GET /health** - Returns `{"status":"ok"}`.
@@ -163,6 +172,7 @@ settings (models, steps, seed, CFG).
     --models models \
     --caption "Melancholic synthwave, slow tempo, analog pads" \
     --lyrics "[verse]..." \
+    --lrc \
     --out song.mp3
 
 # same request schema as the server
@@ -198,6 +208,9 @@ Independent C++ implementation based on
 [MiniMax Music 3](https://github.com/MiniMax-AI/MiniMax-Music3) by MiniMax.
 All model weights are theirs, this is just a native backend.
 Structural template: [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp).
+MiniMax lyric alignment derived from
+[HOT-Step-CPP](https://github.com/scragnog/HOT-Step-CPP); see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ```bibtex
 @misc{minimax2026music3,
