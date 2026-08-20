@@ -73,13 +73,15 @@ void pipeline_configure(MM3Pipeline * p, const MM3ModelPaths & paths, const MM3P
 // codes_out: optional, the audio_codes stream of each song, identical
 // to the input codes under replay. Feeds request_replay.
 // lrc_out: optional, one line-level LRC string per song when get_lrc=true.
+// word_spans_out: optional, one token-derived word-span JSON document per song.
 // Empty entries mean native alignment had insufficient evidence.
 PipelineStatus pipeline_generate(MM3Pipeline *                     p,
                                  const MM3Request &                req,
                                  std::atomic<bool> *               cancel,
                                  std::vector<std::vector<float>> & tracks_out,
                                  std::vector<std::string> *        codes_out,
-                                 std::vector<std::string> *        lrc_out = nullptr);
+                                 std::vector<std::string> *        lrc_out        = nullptr,
+                                 std::vector<std::string> *        word_spans_out = nullptr);
 
 // Autoregressive stage only: lm_batch_size code streams out, no
 // synthesis. codes_out[i] is the audio_codes string of song i (8 comma
@@ -88,4 +90,5 @@ PipelineStatus pipeline_lm_generate(MM3Pipeline *              p,
                                     const MM3Request &         req,
                                     std::atomic<bool> *        cancel,
                                     std::vector<std::string> & codes_out,
-                                    std::vector<std::string> * lrc_out = nullptr);
+                                    std::vector<std::string> * lrc_out        = nullptr,
+                                    std::vector<std::string> * word_spans_out = nullptr);

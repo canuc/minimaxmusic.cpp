@@ -33,7 +33,7 @@ static void print_usage(const char * argv0) {
             "  --steps <N>            Euler steps per DiT window\n"
             "  --seed <N>             DiT noise seed\n"
             "  --lm-seed <N>          Autoregressive sampling seed\n"
-            "  --lrc                  Emit line-level <output>.lrc (LRC-enabled builds)\n"
+            "  --lrc                  Emit <output>.lrc and token-derived <output>.alignment.json\n"
             "\n"
             "Debug:\n"
             "  --max-seq <N>          LM KV cache size (default: model context)\n"
@@ -42,6 +42,17 @@ static void print_usage(const char * argv0) {
             "  --clamp-fp16           Clamp hidden states to FP16 range\n"
             "  --dump <dir>           Dump intermediate tensors\n",
             argv0, argv0);
+}
+
+static bool write_file(const char * path, const std::string & data) {
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[Out] FATAL: cannot write %s\n", path);
+        return false;
+    }
+    const size_t wrote = fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+    return wrote == data.size();
 }
 
 int main(int argc, char ** argv) {
@@ -145,7 +156,8 @@ int main(int argc, char ** argv) {
     std::vector<std::vector<float>> tracks;
     std::vector<std::string>        codes;
     std::vector<std::string>        lrc_by_song;
-    if (pipeline_generate(&pipeline, req, nullptr, tracks, &codes, &lrc_by_song) != PIPELINE_OK) {
+    std::vector<std::string>        word_spans_by_song;
+    if (pipeline_generate(&pipeline, req, nullptr, tracks, &codes, &lrc_by_song, &word_spans_by_song) != PIPELINE_OK) {
         return 1;
     }
 
@@ -175,19 +187,17 @@ int main(int argc, char ** argv) {
         }
         if (i / (size_t) M < lrc_by_song.size() && !lrc_by_song[i / (size_t) M].empty()) {
             std::string lrc_path = (pdot != std::string::npos ? path.substr(0, pdot) : path) + ".lrc";
-            FILE *      lrc_file = fopen(lrc_path.c_str(), "wb");
-            if (!lrc_file) {
-                fprintf(stderr, "[LRC] FATAL: cannot write %s\n", lrc_path.c_str());
-                return 1;
-            }
-            const std::string & text = lrc_by_song[i / (size_t) M];
-            const size_t        wrote = fwrite(text.data(), 1, text.size(), lrc_file);
-            fclose(lrc_file);
-            if (wrote != text.size()) {
-                fprintf(stderr, "[LRC] FATAL: short write to %s\n", lrc_path.c_str());
+            if (!write_file(lrc_path.c_str(), lrc_by_song[i / (size_t) M])) {
                 return 1;
             }
             fprintf(stderr, "[LRC] Wrote %s\n", lrc_path.c_str());
+        }
+        if (i / (size_t) M < word_spans_by_song.size() && !word_spans_by_song[i / (size_t) M].empty()) {
+            std::string alignment_path = (pdot != std::string::npos ? path.substr(0, pdot) : path) + ".alignment.json";
+            if (!write_file(alignment_path.c_str(), word_spans_by_song[i / (size_t) M])) {
+                return 1;
+            }
+            fprintf(stderr, "[LRC] Wrote %s\n", alignment_path.c_str());
         }
     }
     store_free(store);

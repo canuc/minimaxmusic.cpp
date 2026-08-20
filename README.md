@@ -58,12 +58,15 @@ buildall.cmd      # all backends (CUDA + Vulkan + CPU, runtime loading)
 
 macOS auto-enables Metal and Accelerate BLAS with any of the above.
 
-Native line-level lyric timestamps are an optional build feature. Add
+Native lyric timestamps are an optional build feature. Add
 `-DMINIMAXMUSIC_ENABLE_LRC=ON` to the CMake configure command, then request
 them with JSON `"get_lrc": true` or CLI `--lrc`. The default is `OFF`, so
 ordinary builds retain the existing FlashAttention-only binary and behavior.
 Alignment uses the MiniMax LM's lyric attention and needs no extra model or
 weights, but it runs the 36-layer AR attention path manually and is slower.
+The server retains line-level LRC for compatibility and also returns a
+versioned JSON document containing word spans derived directly from the
+monotonic BPE-token-to-frame path.
 
 ## Convert
 
@@ -140,7 +143,8 @@ server caps urlencoded bodies at 8 KB).
 **GET /job?id=N** - Poll job status. **GET /job?id=N&result=1** fetches the
 result as multipart/mixed: one JSON replay request part (the request with
 `audio_codes` and the exact seed of the track), one audio part, and—when
-requested and successfully aligned—one `application/x-lrc` part per track.
+requested and successfully aligned—one `application/x-lrc` part and one
+`application/vnd.minimaxmusic.lyric-alignment+json` word-span part per track.
 For a single track, the same LRC is also base64 encoded in `X-LRC-Text` for
 HOT-Step-compatible workers. MP3 or WAV is selected by `output_format`.
 **POST /job?id=N&cancel=1** cancels a running job.

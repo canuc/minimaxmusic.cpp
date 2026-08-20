@@ -41,8 +41,8 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <cstdint>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -221,17 +221,19 @@ static const char * MULTIPART_BOUNDARY = "mm3-batch-boundary";
 static std::string multipart_build_tracks(const std::vector<std::string> & request_parts,
                                           const std::vector<std::string> & audio_parts,
                                           const std::vector<std::string> & lrc_parts,
+                                          const std::vector<std::string> & word_span_parts,
                                           const char *                     audio_mime) {
     // One set of literal fragments sizes the body exactly and builds it:
     // audio parts weigh tens of MB, growing the string through repeated
     // appends would reallocate and copy them
-    const char * dash       = "--";
-    const char * json_head  = "\r\nContent-Type: application/json\r\n\r\n";
-    const char * audio_head = "\r\nContent-Type: ";
-    const char * lrc_head   = "\r\nContent-Type: application/x-lrc; charset=utf-8\r\n\r\n";
-    const char * head_end   = "\r\n\r\n";
-    const char * crlf       = "\r\n";
-    const char * close_end  = "--\r\n";
+    const char * dash           = "--";
+    const char * json_head      = "\r\nContent-Type: application/json\r\n\r\n";
+    const char * audio_head     = "\r\nContent-Type: ";
+    const char * lrc_head       = "\r\nContent-Type: application/x-lrc; charset=utf-8\r\n\r\n";
+    const char * word_span_head = "\r\nContent-Type: application/vnd.minimaxmusic.lyric-alignment+json\r\n\r\n";
+    const char * head_end       = "\r\n\r\n";
+    const char * crlf           = "\r\n";
+    const char * close_end      = "--\r\n";
 
     const size_t boundary_len = strlen(MULTIPART_BOUNDARY);
     const size_t per_track    = 2 * strlen(dash) + 2 * boundary_len + strlen(json_head) + 2 * strlen(crlf) +
@@ -241,6 +243,9 @@ static std::string multipart_build_tracks(const std::vector<std::string> & reque
         total += per_track + request_parts[i].size() + audio_parts[i].size();
         if (i < lrc_parts.size() && !lrc_parts[i].empty()) {
             total += strlen(dash) + boundary_len + strlen(lrc_head) + lrc_parts[i].size() + strlen(crlf);
+        }
+        if (i < word_span_parts.size() && !word_span_parts[i].empty()) {
+            total += strlen(dash) + boundary_len + strlen(word_span_head) + word_span_parts[i].size() + strlen(crlf);
         }
     }
 
@@ -264,6 +269,13 @@ static std::string multipart_build_tracks(const std::vector<std::string> & reque
             body += MULTIPART_BOUNDARY;
             body += lrc_head;
             body += lrc_parts[i];
+            body += crlf;
+        }
+        if (i < word_span_parts.size() && !word_span_parts[i].empty()) {
+            body += dash;
+            body += MULTIPART_BOUNDARY;
+            body += word_span_head;
+            body += word_span_parts[i];
             body += crlf;
         }
     }
@@ -303,7 +315,7 @@ struct Job {
 
 static std::string base64_encode(const std::string & input) {
     static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
+    std::string       out;
     out.reserve(((input.size() + 2) / 3) * 4);
     uint32_t value = 0;
     int      bits  = -6;
@@ -636,7 +648,9 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         std::vector<std::vector<float>> tracks;
         std::vector<std::string>        codes;
         std::vector<std::string>        lrc_by_song;
-        PipelineStatus status = pipeline_generate(&g_pipeline, r, &job->cancel, tracks, &codes, &lrc_by_song);
+        std::vector<std::string>        word_spans_by_song;
+        PipelineStatus                  status =
+            pipeline_generate(&g_pipeline, r, &job->cancel, tracks, &codes, &lrc_by_song, &word_spans_by_song);
         if (status == PIPELINE_CANCELLED) {
             job->status.store(JobStatus::CANCELLED);
             return;
@@ -668,14 +682,18 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         int                      M = (int) (tracks.size() / codes.size());
         std::vector<std::string> requests(parts.size());
         std::vector<std::string> lrc_parts(parts.size());
+        std::vector<std::string> word_span_parts(parts.size());
         for (size_t i = 0; i < parts.size(); i++) {
             MM3Request replay = request_replay(r, codes[i / M], (int) (i / M), (int) (i % M));
             requests[i]       = request_to_json(&replay, true);
             if (i / (size_t) M < lrc_by_song.size()) {
                 lrc_parts[i] = lrc_by_song[i / (size_t) M];
             }
+            if (i / (size_t) M < word_spans_by_song.size()) {
+                word_span_parts[i] = word_spans_by_song[i / (size_t) M];
+            }
         }
-        job->result_body = multipart_build_tracks(requests, parts, lrc_parts, mime);
+        job->result_body = multipart_build_tracks(requests, parts, lrc_parts, word_span_parts, mime);
         job->result_mime = MULTIPART_MIME;
         if (lrc_parts.size() == 1 && !lrc_parts[0].empty()) {
             job->result_lrc_base64 = base64_encode(lrc_parts[0]);

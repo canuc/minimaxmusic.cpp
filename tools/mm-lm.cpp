@@ -34,7 +34,7 @@ static void print_usage(const char * prog) {
             "  --out <path>           Output request JSON (default: request.json)\n"
             "  --duration <s>         Target duration in seconds\n"
             "  --lm-seed <N>          Autoregressive sampling seed\n"
-            "  --lrc                  Emit line-level LRC beside each request (LRC-enabled builds)\n"
+            "  --lrc                  Emit LRC and token-derived alignment JSON beside each request\n"
             "\n"
             "Output is numbered for batches: request.json -> request0.json ...\n"
             "\n"
@@ -174,7 +174,8 @@ int main(int argc, char ** argv) {
 
     std::vector<std::string> codes;
     std::vector<std::string> lrc;
-    if (pipeline_lm_generate(&pipeline, req, nullptr, codes, &lrc) != PIPELINE_OK) {
+    std::vector<std::string> word_spans;
+    if (pipeline_lm_generate(&pipeline, req, nullptr, codes, &lrc, &word_spans) != PIPELINE_OK) {
         return 1;
     }
 
@@ -198,6 +199,15 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             fprintf(stderr, "[LRC] Wrote %s\n", lrc_path.c_str());
+        }
+        if (i < word_spans.size() && !word_spans[i].empty()) {
+            size_t      alignment_dot = path.rfind('.');
+            std::string alignment_path =
+                (alignment_dot != std::string::npos ? path.substr(0, alignment_dot) : path) + ".alignment.json";
+            if (!write_file(alignment_path.c_str(), word_spans[i])) {
+                return 1;
+            }
+            fprintf(stderr, "[LRC] Wrote %s\n", alignment_path.c_str());
         }
     }
     store_free(store);
